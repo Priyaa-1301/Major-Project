@@ -1,0 +1,12 @@
+pdfminer3
+streamlit
+pandas
+plotly
+streamlit-tags
+Pillow
+yt-dlp
+nltk
+pdfplumber
+python-dotenv
+# spacy is optional — install manually for better name extraction:
+# pip install spacy && python -m spacy download en_core_web_sm
