@@ -38,8 +38,11 @@ from PIL import Image
 from Courses import ds_course, web_course, android_course, ios_course, uiux_course, resume_videos, interview_videos
 import yt_dlp
 import plotly.express as px
+import plotly.graph_objects as go
 from collections import Counter
 import ast
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
 # ─────────────────────────────────────────────────────────────
 # PAGE CONFIG  (must be first Streamlit call)
@@ -807,7 +810,7 @@ def run():
         unsafe_allow_html=True,
     )
     st.sidebar.markdown("---")
-    choice = st.sidebar.selectbox("🔀 Mode", ["👤 Normal User", "🔐 Admin"])
+    choice = st.sidebar.selectbox("🔀 Mode", ["👤 Normal User", "👩‍💼 Recruiter", "🔐 Admin"])
 
     # ── Hero ─────────────────────────────────────────────────
     st.markdown(
@@ -820,6 +823,12 @@ def run():
     # ══════════════════════════════════════════════════════════
     # NORMAL USER
     # ══════════════════════════════════════════════════════════
+    if choice == "👤 Normal User":
+        pass  # handled below
+    elif choice == "👩‍💼 Recruiter":
+        run_recruiter_panel()
+        return
+
     if choice == "👤 Normal User":
         st.markdown('<div class="card">', unsafe_allow_html=True)
         st.markdown("### 📤 Upload Your Resume")
@@ -1316,6 +1325,421 @@ def run():
                 st.plotly_chart(fig4, use_container_width=True)
             else:
                 st.info("No skills data to display yet.")
+
+
+# ─────────────────────────────────────────────────────────────
+# JD MATCH HELPER
+# ─────────────────────────────────────────────────────────────
+def jd_match_score(jd_text: str, resume_text: str) -> float:
+    """TF-IDF cosine similarity between JD and resume (0-100)."""
+    if not jd_text.strip() or not resume_text.strip():
+        return 0.0
+    try:
+        vec = TfidfVectorizer(stop_words='english', max_features=5000)
+        tfidf = vec.fit_transform([jd_text, resume_text])
+        score = float(cosine_similarity(tfidf[0:1], tfidf[1:2])[0][0])
+        return round(score * 100, 1)
+    except Exception:
+        return 0.0
+
+
+# ─────────────────────────────────────────────────────────────
+# RECRUITER PANEL
+# ─────────────────────────────────────────────────────────────
+def run_recruiter_panel():
+    # ── Hero ─────────────────────────────────────────────────
+    st.markdown(
+        '<div class="hero-title">Recruiter Dashboard</div>'
+        '<div class="hero-sub">Bulk-upload candidate resumes, paste your Job Description, '
+        'and instantly get a ranked shortlist powered by AI matching.</div>',
+        unsafe_allow_html=True,
+    )
+
+    # ── Step 1: Job Description ───────────────────────────────
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown("### 📋 Step 1 — Paste Job Description")
+    jd_text = st.text_area(
+        "Paste the full job description here",
+        height=200,
+        placeholder="e.g. We are looking for a Python developer with experience in Django, REST APIs…",
+        key="recruiter_jd",
+    )
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # ── Step 2: Upload Resumes ────────────────────────────────
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown("### 📤 Step 2 — Upload Candidate Resumes")
+    uploaded_files = st.file_uploader(
+        "Upload one or more PDF resumes",
+        type=["pdf"],
+        accept_multiple_files=True,
+        key="recruiter_pdfs",
+    )
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    if not uploaded_files:
+        st.info("⬆️ Upload at least one resume to begin analysis.")
+        return
+
+    if not jd_text.strip():
+        st.warning("⚠️ Please paste a Job Description above before analyzing.")
+        return
+
+    # ── Step 3: Analyze ───────────────────────────────────────
+    analyze_btn = st.button("🚀 Analyze & Rank Candidates", key="recruiter_analyze")
+
+    # Use session state so results survive widget interactions
+    if analyze_btn or st.session_state.get('recruiter_results'):
+        if analyze_btn:
+            results = []
+            upload_dir = './Uploaded_Resumes/'
+            os.makedirs(upload_dir, exist_ok=True)
+
+            prog = st.progress(0)
+            status = st.empty()
+            total = len(uploaded_files)
+
+            for idx, pdf_file in enumerate(uploaded_files):
+                status.markdown(
+                    f'<p style="color:#a78bfa;">🔍 Analyzing <b>{pdf_file.name}</b> ({idx+1}/{total})…</p>',
+                    unsafe_allow_html=True,
+                )
+                save_path = os.path.join(upload_dir, pdf_file.name)
+                with open(save_path, "wb") as f:
+                    f.write(pdf_file.getbuffer())
+
+                resume_data = parse_resume(save_path)
+
+                if resume_data is None:
+                    results.append({
+                        'Rank': '—', 'File': pdf_file.name,
+                        'Name': '—', 'Email': '—',
+                        'JD Match %': 0.0, 'Resume Score': 0,
+                        'Combined Score': 0.0,
+                        'Field': '—', 'Level': '—',
+                        'Skills': [],
+                        '_resume_data': None,
+                        '_score_breakdown': {},
+                    })
+                else:
+                    jd_match = jd_match_score(jd_text, resume_data['full_text'])
+                    res_score, breakdown = compute_resume_score(resume_data)
+                    field = detect_field(resume_data['skills'])
+                    level, _, _ = infer_cand_level(resume_data['no_of_pages'])
+                    combined = round(0.6 * jd_match + 0.4 * res_score, 1)
+
+                    results.append({
+                        'Rank': 0,  # filled after sorting
+                        'File': pdf_file.name,
+                        'Name': resume_data['name'] or pdf_file.name,
+                        'Email': resume_data['email'] or '—',
+                        'Phone': resume_data.get('mobile_number') or '—',
+                        'LinkedIn': resume_data.get('linkedin') or '—',
+                        'JD Match %': jd_match,
+                        'Resume Score': res_score,
+                        'Combined Score': combined,
+                        'Field': field,
+                        'Level': level,
+                        'Skills': resume_data['skills'],
+                        '_resume_data': resume_data,
+                        '_score_breakdown': breakdown,
+                    })
+
+                # Clean up uploaded file
+                if os.path.exists(save_path):
+                    os.remove(save_path)
+
+                prog.progress(int((idx + 1) / total * 100))
+
+            status.empty()
+            prog.empty()
+
+            # Sort by combined score descending and assign ranks
+            results.sort(key=lambda r: r['Combined Score'], reverse=True)
+            for i, r in enumerate(results):
+                r['Rank'] = i + 1
+
+            st.session_state['recruiter_results'] = results
+            st.session_state['recruiter_jd_snapshot'] = jd_text
+
+        results = st.session_state.get('recruiter_results', [])
+        if not results:
+            return
+
+        # ── KPI row ───────────────────────────────────────────
+        st.markdown("### 🏆 Shortlist Overview")
+        k1, k2, k3, k4 = st.columns(4)
+        valid = [r for r in results if r['Combined Score'] > 0]
+        k1.metric("Candidates", len(results))
+        k2.metric("Avg JD Match", f"{sum(r['JD Match %'] for r in valid)/max(len(valid),1):.1f}%")
+        k3.metric("Avg Resume Score", f"{sum(r['Resume Score'] for r in valid)/max(len(valid),1):.0f}/100")
+        top = results[0] if results else None
+        k4.metric("Top Candidate", top['Name'] if top else '—')
+
+        st.markdown("---")
+
+        # ── Filters ───────────────────────────────────────────
+        fcol1, fcol2, fcol3, fcol4 = st.columns([2, 2, 2, 2])
+        with fcol1:
+            min_match = st.slider("Min JD Match %", 0, 100, 0, key="rec_min_match")
+        with fcol2:
+            fields_avail = sorted({r['Field'] for r in results if r['Field'] != '—'})
+            field_f = st.selectbox("Filter by Field", ["All"] + fields_avail, key="rec_field_f")
+        with fcol3:
+            levels_avail = sorted({r['Level'] for r in results if r['Level'] != '—'})
+            level_f = st.selectbox("Filter by Level", ["All"] + levels_avail, key="rec_level_f")
+        with fcol4:
+            shortlist_threshold = st.slider("⭐ Shortlist Threshold", 0, 100, 60, key="rec_shortlist_thresh")
+
+        # ── Auto-shortlist banner ─────────────────────────────
+        shortlisted_count = sum(1 for r in results if r['Combined Score'] >= shortlist_threshold)
+        s_col1, s_col2, s_col3 = st.columns([4, 1, 1])
+        with s_col1:
+            st.markdown(
+                f'<div style="background:rgba(124,58,237,0.15);border:1px solid '
+                f'rgba(124,58,237,0.4);border-radius:10px;padding:0.55rem 1rem;'
+                f'color:#a78bfa;font-weight:600;">'
+                f'⚡ {shortlisted_count} candidate(s) meet the shortlist threshold (≥ {shortlist_threshold})'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+        with s_col2:
+            if st.button("⚡ Shortlist Only", key="rec_auto_shortlist"):
+                st.session_state['rec_shortlisted_only'] = True
+                st.rerun()
+        with s_col3:
+            if st.button("Show All", key="rec_show_all"):
+                st.session_state['rec_shortlisted_only'] = False
+                st.rerun()
+
+        show_shortlisted_only = st.session_state.get('rec_shortlisted_only', False)
+        filtered = [
+            r for r in results
+            if r['JD Match %'] >= min_match
+            and (field_f == "All" or r['Field'] == field_f)
+            and (level_f == "All" or r['Level'] == level_f)
+            and (not show_shortlisted_only or r['Combined Score'] >= shortlist_threshold)
+        ]
+
+        if not filtered:
+            st.warning("No candidates match the current filters.")
+            return
+
+        # ── Leaderboard table ─────────────────────────────────
+        st.markdown("### 📊 Ranked Leaderboard")
+
+
+        table_rows = []
+        for r in filtered:
+            table_rows.append({
+                'Rank':           r['Rank'],
+                'Shortlisted':    '✅ Yes' if r['Combined Score'] >= shortlist_threshold else '❌ No',
+                'Name':           r['Name'],
+                'Email':          r['Email'],
+                'Phone':          r.get('Phone', '—'),
+                'LinkedIn':       r.get('LinkedIn', '—'),
+                'Field':          r['Field'],
+                'Level':          r['Level'],
+                'JD Match %':     r['JD Match %'],
+                'Resume Score':   r['Resume Score'],
+                'Combined Score': r['Combined Score'],
+            })
+
+        tdf = pd.DataFrame(table_rows)
+        st.dataframe(
+            tdf,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                'Rank':           st.column_config.NumberColumn('🏅 Rank', width='small'),
+                'Shortlisted':    st.column_config.TextColumn('⭐ Shortlisted', width='small'),
+                'Name':           st.column_config.TextColumn('👤 Candidate'),
+                'Email':          st.column_config.TextColumn('📧 Email'),
+                'Phone':          st.column_config.TextColumn('📞 Phone'),
+                'LinkedIn':       st.column_config.TextColumn('🔗 LinkedIn'),
+                'Field':          st.column_config.TextColumn('🎯 Field'),
+                'Level':          st.column_config.TextColumn('📈 Level'),
+                'JD Match %':     st.column_config.ProgressColumn(
+                    '📄 JD Match %', min_value=0, max_value=100, format='%.1f%%'
+                ),
+                'Resume Score':   st.column_config.ProgressColumn(
+                    '⭐ Resume Score', min_value=0, max_value=100, format='%d/100'
+                ),
+                'Combined Score': st.column_config.ProgressColumn(
+                    '🔥 Combined Score', min_value=0, max_value=100, format='%.1f'
+                ),
+            },
+        )
+
+        # ── Score distribution chart ───────────────────────────
+        if len(filtered) > 1:
+            chart_df = pd.DataFrame({
+                'Candidate': [r['Name'] for r in filtered],
+                'JD Match %': [r['JD Match %'] for r in filtered],
+                'Resume Score': [r['Resume Score'] for r in filtered],
+                'Combined Score': [r['Combined Score'] for r in filtered],
+            }).sort_values('Combined Score', ascending=False)
+
+            fig = px.bar(
+                chart_df,
+                x='Candidate',
+                y=['JD Match %', 'Resume Score', 'Combined Score'],
+                barmode='group',
+                title='Candidate Score Comparison',
+                color_discrete_map={
+                    'JD Match %': '#38bdf8',
+                    'Resume Score': '#a78bfa',
+                    'Combined Score': '#4ade80',
+                },
+            )
+            fig.update_layout(
+                paper_bgcolor='rgba(0,0,0,0)', font_color='#e0e0e0',
+                plot_bgcolor='rgba(255,255,255,0.03)',
+                legend=dict(orientation='h', yanchor='bottom', y=1.02),
+                xaxis_tickangle=-30,
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+        # ── Per-candidate detail expanders ────────────────────
+        st.markdown("### 🔍 Candidate Details")
+        for r in filtered:
+            badge_color = (
+                '#4ade80' if r['Combined Score'] >= 70
+                else '#fbbf24' if r['Combined Score'] >= 50
+                else '#f87171'
+            )
+            with st.expander(
+                f"#{r['Rank']}  {r['Name']}  —  "
+                f"Combined: {r['Combined Score']:.1f}  |  "
+                f"JD Match: {r['JD Match %']:.1f}%  |  "
+                f"Resume Score: {r['Resume Score']}/100"
+            ):
+                d1, d2, d3, d4 = st.columns(4)
+                d1.metric("JD Match", f"{r['JD Match %']:.1f}%")
+                d2.metric("Resume Score", f"{r['Resume Score']}/100")
+                d3.metric("Combined Score", f"{r['Combined Score']:.1f}")
+                d4.metric("Shortlisted", "✅ Yes" if r['Combined Score'] >= shortlist_threshold else "❌ No")
+
+                st.markdown(
+                    f'<p style="color:#a78bfa; font-weight:600;">'
+                    f'📂 File: {r["File"]} &nbsp;|&nbsp; 🎯 Field: {r["Field"]} '
+                    f'&nbsp;|&nbsp; 📈 Level: {r["Level"]}'
+                    + (f' &nbsp;|&nbsp; 📞 {r["Phone"]}' if r.get('Phone') and r['Phone'] != '—' else '')
+                    + (f' &nbsp;|&nbsp; <a href="https://{r["LinkedIn"]}" target="_blank" style="color:#38bdf8;">🔗 LinkedIn</a>' if r.get('LinkedIn') and r['LinkedIn'] != '—' else '')
+                    + '</p>',
+                    unsafe_allow_html=True,
+                )
+
+                tab_skills, tab_radar, tab_email = st.tabs(["🛠️ Skills", "📡 Radar Chart", "✉️ Email Draft"])
+
+                with tab_skills:
+                    if r['Skills']:
+                        st.markdown("**Detected Skills:**")
+                        st_tags(label='', text='', value=r['Skills'],
+                                key=f"rec_skills_{r['Rank']}_{r['File']}")
+                    rec_skills = FIELD_RECOMMENDED_SKILLS.get(r['Field'], FIELD_RECOMMENDED_SKILLS['General'])
+                    missing = [s for s in rec_skills if s.lower() not in {sk.lower() for sk in r['Skills']}]
+                    if missing:
+                        st.markdown("**💡 Skill Gaps (recommended but missing):**")
+                        st_tags(label='', text='', value=missing[:10],
+                                key=f"rec_missing_{r['Rank']}_{r['File']}")
+                    breakdown = r.get('_score_breakdown', {})
+                    if breakdown:
+                        with st.expander("📋 Resume Score Breakdown", expanded=False):
+                            for key, (pts, cat, label, advice) in SCORE_CRITERIA.items():
+                                passed = breakdown.get(key, False)
+                                if passed:
+                                    st.markdown(f'<p class="tip-ok">✅ {label}</p>', unsafe_allow_html=True)
+                                else:
+                                    st.markdown(f'<p class="tip-bad">⚠️ {label} — {advice}</p>', unsafe_allow_html=True)
+
+                with tab_radar:
+                    breakdown = r.get('_score_breakdown', {})
+                    cats = CATEGORY_ORDER
+                    cat_scores = []
+                    for cat in cats:
+                        got = sum(pts for k, (pts, c, *_) in SCORE_CRITERIA.items() if c == cat and breakdown.get(k))
+                        mx  = CATEGORY_MAX[cat]
+                        cat_scores.append(round(got / mx * 100) if mx else 0)
+                    radar_fig = go.Figure(go.Scatterpolar(
+                        r=cat_scores + [cat_scores[0]],
+                        theta=cats + [cats[0]],
+                        fill='toself',
+                        fillcolor='rgba(124,58,237,0.2)',
+                        line=dict(color='#a78bfa', width=2),
+                        marker=dict(color='#a78bfa', size=7),
+                        name='Score %',
+                    ))
+                    radar_fig.update_layout(
+                        polar=dict(
+                            bgcolor='rgba(0,0,0,0)',
+                            radialaxis=dict(visible=True, range=[0, 100],
+                                           tickfont=dict(color='#b8b8e0', size=9),
+                                           gridcolor='rgba(255,255,255,0.1)'),
+                            angularaxis=dict(tickfont=dict(color='#e0e0e0', size=10),
+                                            gridcolor='rgba(255,255,255,0.1)'),
+                        ),
+                        paper_bgcolor='rgba(0,0,0,0)',
+                        showlegend=False,
+                        margin=dict(l=50, r=50, t=20, b=20),
+                        height=300,
+                    )
+                    st.plotly_chart(radar_fig, use_container_width=True,
+                                    key=f"radar_{r['Rank']}_{r['File']}")
+                    score_cols = st.columns(len(cats))
+                    for i, (cat, sc) in enumerate(zip(cats, cat_scores)):
+                        color = '#4ade80' if sc == 100 else '#38bdf8' if sc >= 60 else '#fbbf24'
+                        score_cols[i].markdown(
+                            f'<div style="text-align:center;font-size:0.8rem;color:{color};font-weight:600;">{cat}<br>{sc}%</div>',
+                            unsafe_allow_html=True
+                        )
+
+                with tab_email:
+                    jd_snapshot = st.session_state.get('recruiter_jd_snapshot', '')
+                    position_hint = jd_snapshot.split('\n')[0][:60].strip() if jd_snapshot else 'the role'
+                    cname = r['Name'] if r['Name'] != '—' else 'Candidate'
+                    first = cname.split()[0]
+                    email_draft = (
+                        f"Subject: Exciting Opportunity — {position_hint}\n\n"
+                        f"Hi {first},\n\n"
+                        f"I came across your profile and was impressed by your background in "
+                        f"{r['Field']}. We have an exciting opening that aligns well with your "
+                        f"skills and experience level ({r['Level']}).\n\n"
+                        f"Your profile scored {r['Combined Score']:.1f}/100 on our AI matching "
+                        f"system (JD Match: {r['JD Match %']:.1f}%, Resume Quality: {r['Resume Score']}/100).\n\n"
+                        f"I'd love to schedule a quick 20-minute call to tell you more about the "
+                        f"role and learn about your career goals. Would you be available this week?\n\n"
+                        f"Best regards,\n"
+                        f"[Your Name]\n"
+                        f"[Your Title] | [Company]\n"
+                        f"[Phone] | [Email]"
+                    )
+                    st.text_area("📧 Outreach Email Draft (click to copy)", value=email_draft,
+                                 height=280, key=f"email_draft_{r['Rank']}_{r['File']}")
+                    st.caption("✏️ Edit the draft above before sending. Replace bracketed placeholders with your details.")
+
+        # ── CSV Export ────────────────────────────────────────
+        st.markdown("---")
+        export_df = pd.DataFrame([{
+            'Rank':           r['Rank'],
+            'Name':           r['Name'],
+            'Email':          r['Email'],
+            'Field':          r['Field'],
+            'Level':          r['Level'],
+            'JD Match %':     r['JD Match %'],
+            'Resume Score':   r['Resume Score'],
+            'Combined Score': r['Combined Score'],
+            'Skills':         ', '.join(r['Skills']),
+            'File':           r['File'],
+        } for r in filtered])
+        csv_bytes = export_df.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            "📥 Export Shortlist as CSV",
+            data=csv_bytes,
+            file_name="recruiter_shortlist.csv",
+            mime="text/csv",
+            key="rec_csv_download",
+        )
 
 
 run()
